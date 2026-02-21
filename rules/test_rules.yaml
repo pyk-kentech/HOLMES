@@ -1,0 +1,27 @@
+﻿rules:
+  - rule_id: TEST_PROC_TO_FILE
+    name: "Test rule: match proc_to_file"
+    source_types: ["process"]
+    target_types: ["file"]
+    prerequisites: []
+    event_predicate:
+      event_type: "proc_to_file"
+    severity: 1
+
+  - rule_id: TEST_FILE_TO_IP
+    name: "Test rule: match file_to_ip"
+    source_types: ["file"]
+    target_types: ["ip"]
+    prerequisites: ["graph_path"]
+    event_predicate:
+      event_type: "file_to_ip"
+    severity: 1
+
+  - rule_id: TEST_PROC_TO_PROC
+    name: "Test rule: match proc_to_proc"
+    source_types: ["process"]
+    target_types: ["process"]
+    prerequisites: ["shared_entity"]
+    event_predicate:
+      event_type: "proc_to_proc"
+    severity: 1

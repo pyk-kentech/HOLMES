@@ -1,0 +1,97 @@
+from pathlib import Path
+
+from engine.core.graph import ProvenanceGraph
+from engine.core.matcher import Matcher
+from engine.io.events import Event
+from engine.rules.schema import RuleSet, load_rules_yaml
+
+
+def test_matcher_returns_zero_when_no_rules():
+    events = [Event(event_id="e1", ts=None, event_type="x", subject="a", object="b", raw={})]
+    graph = ProvenanceGraph()
+    graph.add_events(events)
+
+    matches = Matcher().match(graph=graph, ruleset=RuleSet(), events=events)
+
+    assert matches == []
+
+
+def test_matcher_generates_one_match_for_exec_event_predicate_rule():
+    events = [
+        Event(
+            event_id="e1",
+            ts=None,
+            event_type="file_to_proc",
+            subject="file:/bin/x",
+            object="proc:new",
+            raw={"op": "exec"},
+        ),
+        Event(
+            event_id="e2",
+            ts=None,
+            event_type="read",
+            subject="proc:new",
+            object="file:/tmp/y",
+            raw={"op": "read"},
+        ),
+    ]
+    graph = ProvenanceGraph()
+    graph.add_events(events)
+
+    rules_path = Path(__file__).resolve().parents[1] / "experiments" / "rules_test.yaml"
+    ruleset = load_rules_yaml(rules_path)
+    matches = Matcher().match(graph=graph, ruleset=ruleset, events=events)
+
+    assert len(matches) == 1
+    assert matches[0].rule_id == "test-op-exec"
+    assert matches[0].event_ids == ["e1"]
+
+
+def test_matcher_generates_one_match_for_event_type_predicate_rule(tmp_path):
+    events = [
+        Event(event_id="e1", ts=None, event_type="proc_to_file", subject="proc:a", object="file:x", raw={}),
+        Event(event_id="e2", ts=None, event_type="read", subject="proc:a", object="file:y", raw={}),
+    ]
+    graph = ProvenanceGraph()
+    graph.add_events(events)
+
+    rules_path = tmp_path / "rules_event_type.yaml"
+    rules_path.write_text(
+        "\n".join(
+            [
+                "rules:",
+                "  - rule_id: test-event-type",
+                "    name: test only",
+                "    event_predicate:",
+                "      event_type: proc_to_file",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ruleset = load_rules_yaml(rules_path)
+    matches = Matcher().match(graph=graph, ruleset=ruleset, events=events)
+
+    assert len(matches) == 1
+    assert matches[0].rule_id == "test-event-type"
+    assert matches[0].event_ids == ["e1"]
+
+
+def test_matcher_test_rules_yaml_generates_four_matches_on_sample_events():
+    events = [
+        Event(event_id="e1", ts=None, event_type="proc_to_file", subject="proc:alpha", object="file:/tmp/a.txt", raw={}),
+        Event(event_id="e2", ts=None, event_type="file_to_ip", subject="file:/tmp/a.txt", object="ip:203.0.113.10", raw={}),
+        Event(event_id="e3", ts=None, event_type="proc_to_proc", subject="proc:alpha", object="proc:beta", raw={}),
+        Event(event_id="e4", ts=None, event_type="proc_to_registry", subject="proc:beta", object="reg:HKCU\\Software\\Demo", raw={}),
+        Event(event_id="e5", ts=None, event_type="proc_to_file", subject="proc:gamma", object="file:/var/log/demo.log", raw={}),
+        Event(event_id="e6", ts=None, event_type="file_to_proc", subject="file:/var/log/demo.log", object="proc:delta", raw={}),
+    ]
+    graph = ProvenanceGraph()
+    graph.add_events(events)
+
+    rules_path = Path(__file__).resolve().parents[1] / "rules" / "test_rules.yaml"
+    ruleset = load_rules_yaml(rules_path)
+    matches = Matcher().match(graph=graph, ruleset=ruleset, events=events)
+
+    assert len(matches) == 4
+    assert [m.event_ids[0] for m in matches] == ["e1", "e5", "e2", "e3"]

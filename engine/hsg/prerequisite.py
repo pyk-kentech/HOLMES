@@ -4,6 +4,27 @@ from engine.core.graph import ProvenanceGraph
 from engine.core.matcher import TTPMatch
 
 
+def is_path_factor_satisfied(
+    graph: ProvenanceGraph,
+    src_entity: str,
+    dst_entity: str,
+    threshold: float,
+    op: str = ">=",
+) -> bool:
+    pf = graph.path_factor(src_entity, dst_entity)
+    if pf is None:
+        return False
+    if op == ">=":
+        return pf >= threshold
+    if op == "<=":
+        return pf <= threshold
+    if op == ">":
+        return pf > threshold
+    if op == "<":
+        return pf < threshold
+    raise ValueError(f"Unsupported path_factor op: {op}")
+
+
 def is_prerequisite_satisfied(
     graph: ProvenanceGraph,
     left: TTPMatch,

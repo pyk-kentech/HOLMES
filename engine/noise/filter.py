@@ -12,7 +12,10 @@ from engine.hsg.builder import HSG, HSGEdge, HSGNode
 @dataclass(slots=True)
 class NoiseConfig:
     drop_rule_ids: set[str] = field(default_factory=set)
+    drop_match_ids: set[str] = field(default_factory=set)
     drop_prerequisite_types: set[str] = field(default_factory=set)
+    min_graph_path_weight: float = 0.0
+    min_path_factor: float = 0.0
 
 
 def load_noise_config(path: str | Path) -> NoiseConfig:
@@ -46,21 +49,29 @@ def load_noise_config(path: str | Path) -> NoiseConfig:
         or drop.get("prerequisite_type")
         or []
     )
+    min_graph_path_weight = payload.get("min_graph_path_weight", drop.get("min_graph_path_weight", 0.0))
+    min_path_factor = payload.get("min_path_factor", drop.get("min_path_factor", 0.0))
     if not isinstance(rule_ids, list) or any(not isinstance(x, str) for x in rule_ids):
         raise ValueError("noise.rule_id must be list[str]")
     if not isinstance(prerequisite_types, list) or any(not isinstance(x, str) for x in prerequisite_types):
         raise ValueError("noise.prerequisite_type must be list[str]")
+    if not isinstance(min_graph_path_weight, (int, float)):
+        raise ValueError("noise.min_graph_path_weight must be a number")
+    if not isinstance(min_path_factor, (int, float)):
+        raise ValueError("noise.min_path_factor must be a number")
 
     return NoiseConfig(
         drop_rule_ids=set(rule_ids),
         drop_prerequisite_types=set(prerequisite_types),
+        min_graph_path_weight=float(min_graph_path_weight),
+        min_path_factor=float(min_path_factor),
     )
 
 
 def filter_matches(matches: list[TTPMatch], config: NoiseConfig) -> list[TTPMatch]:
-    if not config.drop_rule_ids:
+    if not config.drop_rule_ids and not config.drop_match_ids:
         return list(matches)
-    return [m for m in matches if m.rule_id not in config.drop_rule_ids]
+    return [m for m in matches if m.rule_id not in config.drop_rule_ids and m.match_id not in config.drop_match_ids]
 
 
 def filter_hsg(hsg: HSG, config: NoiseConfig) -> HSG:
@@ -68,6 +79,13 @@ def filter_hsg(hsg: HSG, config: NoiseConfig) -> HSG:
         e
         for e in hsg.edges
         if e.relation not in config.drop_prerequisite_types
+        and (
+            e.relation != "graph_path"
+            or (
+                float(e.weight or 0.0) >= config.min_graph_path_weight
+                and float(e.path_factor or 0.0) >= config.min_path_factor
+            )
+        )
     ]
     return HSG(nodes=list(hsg.nodes), edges=edges)
 
@@ -81,14 +99,14 @@ def apply_noise_filter(
     keep_ids = {m.match_id for m in matches_after}
 
     nodes_after: list[HSGNode] = [n for n in hsg_before.nodes if n.match_id in keep_ids]
-    edges_after: list[HSGEdge] = [
+    edges_subset: list[HSGEdge] = [
         e
         for e in hsg_before.edges
         if e.src in keep_ids
         and e.dst in keep_ids
-        and e.relation not in config.drop_prerequisite_types
     ]
-    return matches_after, HSG(nodes=nodes_after, edges=edges_after)
+    hsg_after = filter_hsg(HSG(nodes=nodes_after, edges=edges_subset), config)
+    return matches_after, hsg_after
 
 
 def build_noise_counts(before_matches: int, before_nodes: int, before_edges: int, after_matches: int, after_nodes: int, after_edges: int) -> dict:

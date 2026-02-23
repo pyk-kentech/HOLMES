@@ -9,8 +9,19 @@ from engine.core.matcher import Matcher
 from engine.hsg.builder import build_hsg, hsg_to_dict
 from engine.hsg.scorer import rank_hsg_scenarios
 from engine.io.events import load_events_jsonl
-from engine.noise.filter import apply_noise_filter, build_noise_counts, load_noise_config
-from engine.rules.schema import load_rules_yaml
+from engine.noise.filter import NoiseConfig, apply_noise_filter, build_noise_counts, load_noise_config
+from engine.noise.model import get_benign_drop_ids, load_noise_model, save_noise_model, train_noise_model
+from engine.rules.schema import infer_rule_cvss, infer_rule_stage, load_rules_yaml
+
+
+def _parse_paper_weights(raw: str) -> list[float]:
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 7:
+        raise ValueError("--paper-weights must contain exactly 7 comma-separated floats")
+    try:
+        return [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError("--paper-weights must contain valid floats") from exc
 
 
 def run_pipeline(
@@ -19,6 +30,13 @@ def run_pipeline(
     output_path: str,
     noise_path: str | None = None,
     alpha: float | None = None,
+    min_graph_path_weight: float = 0.0,
+    min_path_factor: float = 0.0,
+    scoring_mode: str = "legacy",
+    paper_weights: str = "1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+    paper_mode: str = "hybrid",
+    noise_model_path: str | None = None,
+    noise_bytes_threshold: str = "p95",
 ) -> dict:
     events = load_events_jsonl(events_path)
 
@@ -28,10 +46,27 @@ def run_pipeline(
     ruleset = load_rules_yaml(rules_path)
     matcher = Matcher()
     matches_before = matcher.match(graph=graph, ruleset=ruleset, events=events)
-    hsg_before = build_hsg(matches_before, graph, ruleset)
+    hsg_before = build_hsg(matches_before, graph, ruleset, paper_mode=paper_mode)
+    rule_by_id = {r.rule_id: r for r in ruleset.rules}
+    events_by_id = {e.event_id: e for e in events}
+    trained_noise_stats = {"by_signature": 0, "by_byte_volume": 0}
+    drop_match_ids: set[str] = set()
 
-    if noise_path:
-        noise_config = load_noise_config(noise_path)
+    if noise_model_path:
+        noise_model = load_noise_model(noise_model_path)
+        drop_match_ids, trained_noise_stats = get_benign_drop_ids(
+            matches_before,
+            rule_by_id=rule_by_id,
+            model=noise_model,
+            events_by_id=events_by_id,
+            bytes_threshold=noise_bytes_threshold,
+        )
+
+    if noise_path or min_graph_path_weight > 0.0 or min_path_factor > 0.0 or noise_model_path:
+        noise_config = load_noise_config(noise_path) if noise_path else NoiseConfig()
+        noise_config.drop_match_ids = set(drop_match_ids)
+        noise_config.min_graph_path_weight = max(noise_config.min_graph_path_weight, min_graph_path_weight)
+        noise_config.min_path_factor = max(noise_config.min_path_factor, min_path_factor)
         matches_after, hsg_after = apply_noise_filter(matches_before, hsg_before, noise_config)
     else:
         matches_after, hsg_after = matches_before, hsg_before
@@ -44,6 +79,11 @@ def run_pipeline(
         after_nodes=len(hsg_after.nodes),
         after_edges=len(hsg_after.edges),
     )
+    if noise_model_path:
+        noise_counts["trained_noise"] = {
+            "dropped_matches": len(drop_match_ids),
+            **trained_noise_stats,
+        }
     rule_severity = {r.rule_id: r.severity for r in ruleset.rules}
     # Priority: rules.yaml scoring.alpha > CLI --alpha > default 1.0
     if ruleset.has_scoring_alpha:
@@ -52,12 +92,18 @@ def run_pipeline(
         scoring_alpha = alpha
     else:
         scoring_alpha = 1.0
+    rule_stage = {r.rule_id: infer_rule_stage(r) for r in ruleset.rules}
+    rule_cvss = {r.rule_id: infer_rule_cvss(r) for r in ruleset.rules}
     top_scenarios = rank_hsg_scenarios(
         hsg_after,
         scoring="weighted",
         rule_severity=rule_severity,
         alpha=scoring_alpha,
         top_k=3,
+        score_mode=scoring_mode,
+        rule_stage=rule_stage,
+        rule_cvss=rule_cvss,
+        paper_weights=_parse_paper_weights(paper_weights),
     )
 
     result = {
@@ -95,9 +141,61 @@ def run_pipeline(
     return result
 
 
+def train_noise_model_pipeline(
+    train_events_path: str,
+    rules_path: str,
+    output_path: str,
+    save_noise_model_path: str,
+    min_count: int = 5,
+    bytes_min_count: int = 20,
+) -> dict:
+    events = load_events_jsonl(train_events_path)
+    graph = ProvenanceGraph()
+    graph.add_events(events)
+
+    ruleset = load_rules_yaml(rules_path)
+    matcher = Matcher()
+    matches = matcher.match(graph=graph, ruleset=ruleset, events=events)
+    rule_by_id = {r.rule_id: r for r in ruleset.rules}
+    events_by_id = {e.event_id: e for e in events}
+    model = train_noise_model(
+        matches,
+        rule_by_id=rule_by_id,
+        min_count=min_count,
+        bytes_min_count=bytes_min_count,
+        events_by_id=events_by_id,
+    )
+    save_noise_model(model, save_noise_model_path)
+
+    result = {
+        "summary": {
+            "mode": "train_noise_model",
+            "events": len(events),
+            "rules": len(ruleset.rules),
+            "matches": len(matches),
+            "benign_signatures": len(model.benign_signatures),
+            "noise_model_path": str(save_noise_model_path),
+            "min_count": int(min_count),
+            "bytes_min_count": int(bytes_min_count),
+        },
+        "noise_model": {
+            "version": model.version,
+            "benign_signatures": len(model.benign_signatures),
+            "has_byte_volume": bool(model.byte_volume),
+        },
+    }
+
+    output_dir = Path(output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    (output_dir / "summary.json").write_text(json.dumps(result["summary"], indent=2), encoding="utf-8")
+    return result
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="HOLMES-style APT detection MVP pipeline")
-    parser.add_argument("--events", required=True, help="Path to input events JSONL")
+    parser.add_argument("--events", required=False, help="Path to input events JSONL (detect mode)")
+    parser.add_argument("--train-events", dest="train_events", required=False, help="Path to benign events JSONL (train mode)")
     parser.add_argument("--rules", required=True, help="Path to YAML rules file")
     parser.add_argument(
         "--out",
@@ -113,24 +211,112 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to static noise config YAML (optional; when omitted no noise filter is applied)",
     )
     parser.add_argument(
+        "--noise-model",
+        dest="noise_model",
+        default=None,
+        help="Path to trained benign noise model JSON (optional; detect mode).",
+    )
+    parser.add_argument(
+        "--save-noise-model",
+        dest="save_noise_model",
+        default=None,
+        help="Output path for trained noise model JSON (train mode).",
+    )
+    parser.add_argument(
+        "--noise-min-count",
+        dest="noise_min_count",
+        type=int,
+        default=5,
+        help="Minimum signature count to keep as benign in training (default: 5).",
+    )
+    parser.add_argument(
+        "--noise-bytes-min-count",
+        dest="noise_bytes_min_count",
+        type=int,
+        default=20,
+        help="Minimum samples per rule_id for byte-volume model in training (default: 20).",
+    )
+    parser.add_argument(
+        "--noise-bytes-threshold",
+        dest="noise_bytes_threshold",
+        choices=["p50", "p95", "p99", "max"],
+        default="p95",
+        help="Byte-volume threshold key used in detect mode with --noise-model (default: p95).",
+    )
+    parser.add_argument(
         "--alpha",
         dest="alpha",
         type=float,
         default=None,
         help="Weighted-scenario alpha (severity + alpha*weight). Overridden by rules scoring.alpha if set.",
     )
+    parser.add_argument(
+        "--min-graph-path-weight",
+        dest="min_graph_path_weight",
+        type=float,
+        default=0.0,
+        help="Drop graph_path edges with weight below this threshold (default: 0.0).",
+    )
+    parser.add_argument(
+        "--min-path-factor",
+        dest="min_path_factor",
+        type=float,
+        default=0.0,
+        help="Drop graph_path edges with path_factor below this threshold (default: 0.0).",
+    )
+    parser.add_argument(
+        "--scoring",
+        dest="scoring_mode",
+        choices=["legacy", "paper"],
+        default="legacy",
+        help="Scenario scoring mode (legacy additive or paper weighted-product).",
+    )
+    parser.add_argument(
+        "--paper-weights",
+        dest="paper_weights",
+        default="1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+        help="Comma-separated 7 floats for paper weighted-product scoring.",
+    )
+    parser.add_argument(
+        "--paper-mode",
+        dest="paper_mode",
+        choices=["hybrid", "strict"],
+        default="hybrid",
+        help="graph_path edge-weight mode: hybrid=dependency_strength*path_factor, strict=path_factor.",
+    )
     return parser
 
 
 def main() -> int:
     args = _build_parser().parse_args()
-    run_pipeline(
-        events_path=args.events,
-        rules_path=args.rules,
-        output_path=args.out,
-        noise_path=args.noise,
-        alpha=args.alpha,
-    )
+    if args.train_events:
+        if not args.save_noise_model:
+            raise SystemExit("--save-noise-model is required when --train-events is used")
+        train_noise_model_pipeline(
+            train_events_path=args.train_events,
+            rules_path=args.rules,
+            output_path=args.out,
+            save_noise_model_path=args.save_noise_model,
+            min_count=max(1, int(args.noise_min_count)),
+            bytes_min_count=max(1, int(args.noise_bytes_min_count)),
+        )
+    else:
+        if not args.events:
+            raise SystemExit("--events is required in detect mode")
+        run_pipeline(
+            events_path=args.events,
+            rules_path=args.rules,
+            output_path=args.out,
+            noise_path=args.noise,
+            alpha=args.alpha,
+            min_graph_path_weight=args.min_graph_path_weight,
+            min_path_factor=args.min_path_factor,
+            scoring_mode=args.scoring_mode,
+            paper_weights=args.paper_weights,
+            paper_mode=args.paper_mode,
+            noise_model_path=args.noise_model,
+            noise_bytes_threshold=args.noise_bytes_threshold,
+        )
     return 0
 
 

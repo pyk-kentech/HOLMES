@@ -68,7 +68,7 @@ def test_run_pipeline_sample_with_test_rules_has_expected_matches_and_hsg_relati
     relations = [edge["relation"] for edge in hsg["edges"]]
     assert relations.count("shared_entity") == 1
     assert relations.count("graph_path") >= 1
-    # B3/B5 weighted score: node severities + edge weights (graph_path=0.5, shared_entity has no weight)
+    # B3/B9 weighted score: node severities + edge weights (graph_path=0.5, shared_entity has no weight)
     assert abs(float(summary["top_scenarios"][0]["score"]) - 3.5) <= 1e-9
 
 

@@ -31,8 +31,8 @@ def test_path_factor_mac_distinguishes_single_vs_parallel_two_hop_paths():
     assert g_single.min_vertex_cut_size("A", "B") == 1
     assert g_parallel.min_vertex_cut_size("A", "B") == 2
 
-    pf_single = g_single.path_factor("A", "B")
-    pf_parallel = g_parallel.path_factor("A", "B")
+    pf_single = g_single.path_factor_legacy_mac("A", "B")
+    pf_parallel = g_parallel.path_factor_legacy_mac("A", "B")
     assert pf_single == pytest.approx(0.5)
     assert pf_parallel == pytest.approx(1.0 / 3.0)
     assert pf_single > pf_parallel
@@ -44,4 +44,4 @@ def test_path_factor_mac_no_path_is_zero():
     g.add_event(Event(event_id="e2", ts=None, event_type="flow", subject="C", object="D", raw={}))
 
     assert g.min_vertex_cut_size("A", "D") is None
-    assert g.path_factor("A", "D") == 0.0
+    assert g.path_factor_legacy_mac("A", "D") == 0.0

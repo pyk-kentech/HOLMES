@@ -49,7 +49,7 @@ def test_path_factor_final_weight_decreases_with_longer_path():
 
     assert w_one_hop > w_two_hop
     assert w_one_hop == pytest.approx(0.5)
-    assert w_two_hop == pytest.approx(1.0 / 6.0)
+    assert w_two_hop == pytest.approx(1.0 / 3.0)
 
 
 def test_path_factor_no_path_is_zero():

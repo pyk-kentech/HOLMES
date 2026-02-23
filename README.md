@@ -52,7 +52,8 @@ Edges without a `weight` field contribute 0.
 
 ## Path factor (MAC MVP)
 
-`path_factor(from_entity, to_entity)` uses directed minimum intermediate vertex cut size `C`.
-If no directed path exists, path_factor is `0.0`.
-Otherwise `path_factor = 1.0 / (1.0 + C)` where `src/dst` are excluded from removable nodes.
-`graph_path` edge weight in `out/hsg.json` is `dependency_strength * path_factor`.
+Default `path_factor(from_entity, to_entity)` follows paper-style incremental propagation.
+If no directed path exists, path_factor is `0.0`, and `path_factor(src, src) = 1.0`.
+Process-node transitions without common ancestor with `src` increase path_factor by 1; non-process transitions keep it.
+When multiple paths exist, the minimum propagated value is used.
+Legacy MAC approximation remains available as `path_factor_legacy_mac(...)`.

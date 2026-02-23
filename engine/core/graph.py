@@ -23,6 +23,9 @@ class ProvenanceGraph:
         self.nodes: set[str] = set()
         self.adj: dict[str, set[str]] = defaultdict(set)
         self.edges: list[Edge] = []
+        self.process_parents: dict[str, set[str]] = defaultdict(set)
+        self._process_ancestor_cache: dict[str, set[str]] = {}
+        self._path_factor_cache: dict[str, dict[str, float]] = {}
 
     @staticmethod
     def _flow_direction(event: Event) -> tuple[str, str]:
@@ -46,6 +49,13 @@ class ProvenanceGraph:
         self.nodes.add(event.subject)
         self.nodes.add(event.object)
         self.adj[src].add(dst)
+        self._path_factor_cache.clear()
+
+        # Process lineage relation for common-ancestor checks.
+        if event.event_type.lower() in {"proc_to_proc", "fork"} and self._is_process_node(event.subject) and self._is_process_node(event.object):
+            self.process_parents[event.object].add(event.subject)
+            self._process_ancestor_cache.clear()
+
         self.edges.append(
             Edge(
                 src=src,
@@ -124,6 +134,75 @@ class ProvenanceGraph:
         if path_len is None:
             return 0.0
         return 1.0 / (1.0 + path_len)
+
+    @staticmethod
+    def _is_process_node(node: str | None) -> bool:
+        if not node:
+            return False
+        return node.split(":", 1)[0].lower() == "proc"
+
+    def _process_ancestors(self, process_node: str) -> set[str]:
+        if process_node in self._process_ancestor_cache:
+            return self._process_ancestor_cache[process_node]
+
+        ancestors: set[str] = {process_node}
+        q: deque[str] = deque([process_node])
+        while q:
+            cur = q.popleft()
+            for parent in self.process_parents.get(cur, set()):
+                if parent in ancestors:
+                    continue
+                ancestors.add(parent)
+                q.append(parent)
+        self._process_ancestor_cache[process_node] = ancestors
+        return ancestors
+
+    def _has_common_ancestor(self, process_a: str, process_b: str) -> bool:
+        return bool(self._process_ancestors(process_a) & self._process_ancestors(process_b))
+
+    def _paper_path_factor_map(self, src: str) -> dict[str, float]:
+        """
+        Paper-faithful incremental propagation (MVP):
+        - pf(src, src) = 1
+        - transition u -> v:
+            * if v is non-process: no increment
+            * if v is process and src/v share common ancestor: no increment
+            * else increment by 1
+        - multi-path case uses min accumulated value.
+        """
+        if src not in self.nodes:
+            return {}
+
+        # Dijkstra on non-negative edge costs (0/1) to realize min over multiple flows.
+        import heapq
+
+        best: dict[str, float] = {src: 1.0}
+        heap: list[tuple[float, str]] = [(1.0, src)]
+
+        while heap:
+            cur_pf, cur = heapq.heappop(heap)
+            if cur_pf > best.get(cur, float("inf")):
+                continue
+
+            for nxt in self.adj.get(cur, set()):
+                inc = 0.0
+                if self._is_process_node(nxt):
+                    if not (self._is_process_node(src) and self._has_common_ancestor(src, nxt)):
+                        inc = 1.0
+                cand = cur_pf + inc
+                if cand < best.get(nxt, float("inf")):
+                    best[nxt] = cand
+                    heapq.heappush(heap, (cand, nxt))
+        return best
+
+    def path_factor_legacy_mac(self, src: str, dst: str) -> float:
+        """
+        Legacy B5/B6 approximation retained for compatibility experiments.
+        """
+        cut_size = self.min_vertex_cut_size(src, dst)
+        if cut_size is None:
+            return 0.0
+        return 1.0 / (1.0 + max(cut_size, 1))
 
     def min_vertex_cut_size(self, src: str, dst: str) -> int | None:
         """
@@ -205,15 +284,21 @@ class ProvenanceGraph:
 
     def path_factor(self, src: str, dst: str) -> float:
         """
-        Path-factor MVP (MAC approximation) for directed graph_path scoring.
-
-        - no src -> dst path: 0.0
-        - control_cut C (minimum intermediate vertex cut size): 1.0 / (1.0 + C)
+        Paper-faithful path factor (default):
+        - pf(src, src) = 1
+        - no path from src to dst => 0.0
+        - process-node transitions without common ancestor with src increase pf by 1
+        - non-process transitions keep pf unchanged
+        - multi-path uses minimum pf among reachable flows
         """
-        cut_size = self.min_vertex_cut_size(src, dst)
-        if cut_size is None:
+        if src not in self.nodes or dst not in self.nodes:
             return 0.0
-        return 1.0 / (1.0 + cut_size)
+        if src == dst:
+            return 1.0
+
+        if src not in self._path_factor_cache:
+            self._path_factor_cache[src] = self._paper_path_factor_map(src)
+        return self._path_factor_cache[src].get(dst, 0.0)
 
     def path(self, src: str, dst: str) -> list[str] | None:
         """Return one shortest path from src to dst if it exists."""

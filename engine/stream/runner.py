@@ -14,7 +14,7 @@ from engine.hsg.prerequisite import is_path_factor_satisfied, is_prerequisite_sa
 from engine.hsg.scorer import rank_hsg_scenarios
 from engine.io.events import Event
 from engine.noise.model import NoiseModel, get_benign_drop_ids
-from engine.rules.schema import RuleSet, infer_rule_cvss, infer_rule_stage, path_factor_prerequisites, prerequisite_types
+from engine.rules.schema import RuleSet, infer_rule_cvss, infer_rule_stage
 
 
 @dataclass(slots=True)
@@ -34,16 +34,28 @@ class StreamingEngine:
         scoring_mode: str = "legacy",
         paper_weights: list[float] | None = None,
         paper_mode: str = "hybrid",
+        prereq_policy: str = "union",
         alpha: float | None = None,
         noise_model: NoiseModel | None = None,
         noise_bytes_threshold: str = "p95",
+        noise_signature_min_ratio: float = 0.1,
+        graph_path_allowlist: set[tuple[str, str]] | None = None,
+        max_graph_path_edges: int = 10000,
+        max_graph_path_candidates_per_match: int = 200,
     ) -> None:
         self.ruleset = ruleset
         self.scoring_mode = scoring_mode
         self.paper_weights = paper_weights
         self.paper_mode = paper_mode
+        if prereq_policy not in hsg_builder.SUPPORTED_PREREQ_POLICIES:
+            raise ValueError("prereq_policy must be 'dst_only' or 'union'")
+        self.prereq_policy = prereq_policy
         self.noise_model = noise_model
         self.noise_bytes_threshold = noise_bytes_threshold
+        self.noise_signature_min_ratio = max(0.0, min(1.0, float(noise_signature_min_ratio)))
+        self.graph_path_allowlist = graph_path_allowlist
+        self.max_graph_path_edges = max_graph_path_edges
+        self.max_graph_path_candidates_per_match = max_graph_path_candidates_per_match
 
         self.graph = ProvenanceGraph()
         self.matcher = Matcher()
@@ -64,6 +76,9 @@ class StreamingEngine:
         self.hsg_nodes: dict[str, HSGNode] = {}
         self.hsg_edges: list[HSGEdge] = []
         self.seen_edges: set[tuple[str, str, str]] = set()
+        self._descendants_cache: dict[str, set[str]] = {}
+        self._graph_path_edges_count = 0
+        self._graph_path_candidates_by_src: dict[str, int] = defaultdict(int)
 
         # Pointer propagation MVP indexes.
         self.node_to_matches: dict[str, set[str]] = defaultdict(set)
@@ -101,14 +116,21 @@ class StreamingEngine:
     def _edge_for_pair(self, left: TTPMatch, right: TTPMatch) -> list[HSGEdge]:
         left_rule = self.rule_by_id.get(left.rule_id)
         right_rule = self.rule_by_id.get(right.rule_id)
-        left_prereqs = prerequisite_types(left_rule)
-        right_prereqs = prerequisite_types(right_rule)
-        prereq_types = left_prereqs | right_prereqs
+        prereq_types = hsg_builder.prerequisite_relations_for_pair(left_rule, right_rule, self.prereq_policy)
 
         built: list[HSGEdge] = []
         for relation in prereq_types:
-            if relation == "graph_path" and (left.rule_id, right.rule_id) not in hsg_builder.GRAPH_PATH_ALLOWLIST:
-                continue
+            if relation == "graph_path":
+                allowlist = self.graph_path_allowlist if self.graph_path_allowlist is not None else hsg_builder.GRAPH_PATH_ALLOWLIST
+                if allowlist is not None and (left.rule_id, right.rule_id) not in allowlist:
+                    continue
+                if self._graph_path_candidates_by_src[left.match_id] >= self.max_graph_path_candidates_per_match:
+                    continue
+                if self._graph_path_edges_count >= self.max_graph_path_edges:
+                    continue
+                if not hsg_builder.is_graph_path_candidate(self.graph, left, right, self._descendants_cache):
+                    continue
+                self._graph_path_candidates_by_src[left.match_id] += 1
             config = hsg_builder._resolve_prereq_config(relation, left.rule_id, right.rule_id)  # noqa: SLF001
             if not is_prerequisite_satisfied(self.graph, left, right, relation, config):
                 continue
@@ -126,7 +148,7 @@ class StreamingEngine:
                 to_entity = right.bindings.get(to_binding) if to_binding else None
                 if not from_entity or not to_entity:
                     continue
-                path_factor_reqs = path_factor_prerequisites(left_rule) + path_factor_prerequisites(right_rule)
+                path_factor_reqs = hsg_builder.path_factor_prerequisites_for_pair(left_rule, right_rule, self.prereq_policy)
                 if any(
                     not is_path_factor_satisfied(
                         self.graph,
@@ -157,6 +179,8 @@ class StreamingEngine:
                     dependency_strength=edge_dependency_strength,
                 )
             )
+            if relation == "graph_path":
+                self._graph_path_edges_count += 1
         return built
 
     def _apply_noise_model(self, new_matches: list[TTPMatch]) -> list[TTPMatch]:
@@ -168,6 +192,7 @@ class StreamingEngine:
             model=self.noise_model,
             events_by_id=self.events_by_id,
             bytes_threshold=self.noise_bytes_threshold,
+            signature_min_ratio=self.noise_signature_min_ratio,
         )
         self.stats.by_signature += int(noise_stats.get("by_signature", 0))
         self.stats.by_byte_volume += int(noise_stats.get("by_byte_volume", 0))

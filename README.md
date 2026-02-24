@@ -57,3 +57,6 @@ If no directed path exists, path_factor is `0.0`, and `path_factor(src, src) = 1
 Process-node transitions without common ancestor with `src` increase path_factor by 1; non-process transitions keep it.
 When multiple paths exist, the minimum propagated value is used.
 Legacy MAC approximation remains available as `path_factor_legacy_mac(...)`.
+For threshold filtering, `--path-factor-op ge` means keep edges with `path_factor >= threshold` (legacy behavior).
+`--path-factor-op le` means keep edges with `path_factor <= threshold` (paper-style max allowed path_factor).
+In strict paper experiments, use `--paper-mode strict --path-factor-op le` to suppress weak/high-cost links.

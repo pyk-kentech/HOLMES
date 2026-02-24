@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from engine.core.graph import ProvenanceGraph
+from engine.core.graph import ProvenanceGraph, path_factor_passes
 from engine.core.matcher import TTPMatch
 
 
@@ -15,9 +15,9 @@ def is_path_factor_satisfied(
     if pf is None:
         return False
     if op == ">=":
-        return pf >= threshold
+        return path_factor_passes(pf, threshold, "ge")
     if op == "<=":
-        return pf <= threshold
+        return path_factor_passes(pf, threshold, "le")
     if op == ">":
         return pf > threshold
     if op == "<":

@@ -122,7 +122,12 @@ def test_hsg_builder_graph_path_only_for_allowed_rule_pair():
     ruleset = load_rules_yaml(repo_root / "rules" / "test_rules.yaml")
     matches = Matcher().match(g, ruleset, events)
 
-    hsg = build_hsg(matches, g, ruleset)
+    hsg = build_hsg(
+        matches,
+        g,
+        ruleset,
+        graph_path_allowlist={("TEST_PROC_TO_FILE", "TEST_FILE_TO_IP")},
+    )
     node_rule = {n.match_id: n.rule_id for n in hsg.nodes}
     graph_path_edges = [e for e in hsg.edges if e.relation == "graph_path"]
 
@@ -165,6 +170,11 @@ def test_hsg_builder_graph_path_not_created_for_disallowed_rule_pair():
         ),
     ]
 
-    hsg = build_hsg(matches, g, ruleset)
+    hsg = build_hsg(
+        matches,
+        g,
+        ruleset,
+        graph_path_allowlist={("TEST_PROC_TO_FILE", "TEST_FILE_TO_IP")},
+    )
 
     assert all(edge.relation != "graph_path" for edge in hsg.edges)

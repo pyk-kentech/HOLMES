@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from engine.core.graph import path_factor_passes
 from engine.core.matcher import TTPMatch
 from engine.hsg.builder import HSG, HSGEdge, HSGNode
 
@@ -16,6 +17,7 @@ class NoiseConfig:
     drop_prerequisite_types: set[str] = field(default_factory=set)
     min_graph_path_weight: float = 0.0
     min_path_factor: float = 0.0
+    path_factor_op: str = "ge"
 
 
 def load_noise_config(path: str | Path) -> NoiseConfig:
@@ -51,6 +53,7 @@ def load_noise_config(path: str | Path) -> NoiseConfig:
     )
     min_graph_path_weight = payload.get("min_graph_path_weight", drop.get("min_graph_path_weight", 0.0))
     min_path_factor = payload.get("min_path_factor", drop.get("min_path_factor", 0.0))
+    path_factor_op = str(payload.get("path_factor_op", drop.get("path_factor_op", "ge"))).lower()
     if not isinstance(rule_ids, list) or any(not isinstance(x, str) for x in rule_ids):
         raise ValueError("noise.rule_id must be list[str]")
     if not isinstance(prerequisite_types, list) or any(not isinstance(x, str) for x in prerequisite_types):
@@ -59,12 +62,15 @@ def load_noise_config(path: str | Path) -> NoiseConfig:
         raise ValueError("noise.min_graph_path_weight must be a number")
     if not isinstance(min_path_factor, (int, float)):
         raise ValueError("noise.min_path_factor must be a number")
+    if path_factor_op not in {"ge", "le"}:
+        raise ValueError("noise.path_factor_op must be 'ge' or 'le'")
 
     return NoiseConfig(
         drop_rule_ids=set(rule_ids),
         drop_prerequisite_types=set(prerequisite_types),
         min_graph_path_weight=float(min_graph_path_weight),
         min_path_factor=float(min_path_factor),
+        path_factor_op=str(path_factor_op),
     )
 
 
@@ -83,7 +89,7 @@ def filter_hsg(hsg: HSG, config: NoiseConfig) -> HSG:
             e.relation != "graph_path"
             or (
                 float(e.weight or 0.0) >= config.min_graph_path_weight
-                and float(e.path_factor or 0.0) >= config.min_path_factor
+                and path_factor_passes(e.path_factor, config.min_path_factor, config.path_factor_op)
             )
         )
     ]

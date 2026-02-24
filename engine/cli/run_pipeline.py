@@ -6,7 +6,7 @@ from pathlib import Path
 
 from engine.core.graph import ProvenanceGraph
 from engine.core.matcher import Matcher
-from engine.hsg.builder import build_hsg, hsg_to_dict
+from engine.hsg.builder import build_hsg, hsg_to_dict, load_graph_path_allowlist
 from engine.hsg.scorer import rank_hsg_scenarios
 from engine.io.events import load_events_jsonl
 from engine.noise.filter import NoiseConfig, apply_noise_filter, build_noise_counts, load_noise_config
@@ -32,12 +32,24 @@ def run_pipeline(
     alpha: float | None = None,
     min_graph_path_weight: float = 0.0,
     min_path_factor: float = 0.0,
+    path_factor_op: str = "ge",
     scoring_mode: str = "legacy",
     paper_weights: str = "1.0,1.0,1.0,1.0,1.0,1.0,1.0",
     paper_mode: str = "hybrid",
+    prereq_policy: str = "union",
     noise_model_path: str | None = None,
     noise_bytes_threshold: str = "p95",
+    noise_signature_min_ratio: float = 0.1,
+    graph_path_allowlist: str | None = "none",
+    max_graph_path_edges: int = 10000,
+    max_graph_path_candidates_per_match: int = 200,
 ) -> dict:
+    if path_factor_op not in {"ge", "le"}:
+        raise ValueError("path_factor_op must be one of: ge, le")
+    if prereq_policy not in {"dst_only", "union"}:
+        raise ValueError("prereq_policy must be one of: dst_only, union")
+    noise_signature_min_ratio = max(0.0, min(1.0, float(noise_signature_min_ratio)))
+
     events = load_events_jsonl(events_path)
 
     graph = ProvenanceGraph()
@@ -46,7 +58,17 @@ def run_pipeline(
     ruleset = load_rules_yaml(rules_path)
     matcher = Matcher()
     matches_before = matcher.match(graph=graph, ruleset=ruleset, events=events)
-    hsg_before = build_hsg(matches_before, graph, ruleset, paper_mode=paper_mode)
+    allowlist = load_graph_path_allowlist(graph_path_allowlist)
+    hsg_before = build_hsg(
+        matches_before,
+        graph,
+        ruleset,
+        paper_mode=paper_mode,
+        prereq_policy=prereq_policy,
+        graph_path_allowlist=allowlist,
+        max_graph_path_edges=max_graph_path_edges,
+        max_graph_path_candidates_per_match=max_graph_path_candidates_per_match,
+    )
     rule_by_id = {r.rule_id: r for r in ruleset.rules}
     events_by_id = {e.event_id: e for e in events}
     trained_noise_stats = {"by_signature": 0, "by_byte_volume": 0}
@@ -60,6 +82,7 @@ def run_pipeline(
             model=noise_model,
             events_by_id=events_by_id,
             bytes_threshold=noise_bytes_threshold,
+            signature_min_ratio=noise_signature_min_ratio,
         )
 
     if noise_path or min_graph_path_weight > 0.0 or min_path_factor > 0.0 or noise_model_path:
@@ -67,6 +90,7 @@ def run_pipeline(
         noise_config.drop_match_ids = set(drop_match_ids)
         noise_config.min_graph_path_weight = max(noise_config.min_graph_path_weight, min_graph_path_weight)
         noise_config.min_path_factor = max(noise_config.min_path_factor, min_path_factor)
+        noise_config.path_factor_op = path_factor_op
         matches_after, hsg_after = apply_noise_filter(matches_before, hsg_before, noise_config)
     else:
         matches_after, hsg_after = matches_before, hsg_before
@@ -148,7 +172,9 @@ def train_noise_model_pipeline(
     save_noise_model_path: str,
     min_count: int = 5,
     bytes_min_count: int = 20,
+    signature_min_ratio: float = 0.1,
 ) -> dict:
+    signature_min_ratio = max(0.0, min(1.0, float(signature_min_ratio)))
     events = load_events_jsonl(train_events_path)
     graph = ProvenanceGraph()
     graph.add_events(events)
@@ -163,6 +189,7 @@ def train_noise_model_pipeline(
         rule_by_id=rule_by_id,
         min_count=min_count,
         bytes_min_count=bytes_min_count,
+        signature_min_ratio=signature_min_ratio,
         events_by_id=events_by_id,
     )
     save_noise_model(model, save_noise_model_path)
@@ -177,6 +204,7 @@ def train_noise_model_pipeline(
             "noise_model_path": str(save_noise_model_path),
             "min_count": int(min_count),
             "bytes_min_count": int(bytes_min_count),
+            "signature_min_ratio": float(signature_min_ratio),
         },
         "noise_model": {
             "version": model.version,
@@ -244,6 +272,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Byte-volume threshold key used in detect mode with --noise-model (default: p95).",
     )
     parser.add_argument(
+        "--noise-signature-min-ratio",
+        dest="noise_signature_min_ratio",
+        type=float,
+        default=0.1,
+        help="Minimum benign signature frequency ratio within the same rule_id needed to drop (default: 0.1).",
+    )
+    parser.add_argument(
         "--alpha",
         dest="alpha",
         type=float,
@@ -262,7 +297,14 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="min_path_factor",
         type=float,
         default=0.0,
-        help="Drop graph_path edges with path_factor below this threshold (default: 0.0).",
+        help="Path-factor threshold value used with --path-factor-op (default: 0.0).",
+    )
+    parser.add_argument(
+        "--path-factor-op",
+        dest="path_factor_op",
+        choices=["ge", "le"],
+        default="ge",
+        help="Path-factor threshold direction: ge means pf>=threshold, le means pf<=threshold.",
     )
     parser.add_argument(
         "--scoring",
@@ -284,6 +326,33 @@ def _build_parser() -> argparse.ArgumentParser:
         default="hybrid",
         help="graph_path edge-weight mode: hybrid=dependency_strength*path_factor, strict=path_factor.",
     )
+    parser.add_argument(
+        "--prereq-policy",
+        dest="prereq_policy",
+        choices=["dst_only", "union"],
+        default="union",
+        help="Prerequisite relation policy: union keeps legacy behavior; dst_only uses only destination rule prerequisites.",
+    )
+    parser.add_argument(
+        "--graph-path-allowlist",
+        dest="graph_path_allowlist",
+        default="none",
+        help="Optional allowlist file for graph_path rule pairs; use 'none' to disable (default).",
+    )
+    parser.add_argument(
+        "--max-graph-path-edges",
+        dest="max_graph_path_edges",
+        type=int,
+        default=10000,
+        help="Maximum number of graph_path edges to create (default: 10000).",
+    )
+    parser.add_argument(
+        "--max-graph-path-candidates-per-match",
+        dest="max_graph_path_candidates_per_match",
+        type=int,
+        default=200,
+        help="Maximum graph_path destination candidates evaluated per source match (default: 200).",
+    )
     return parser
 
 
@@ -299,6 +368,7 @@ def main() -> int:
             save_noise_model_path=args.save_noise_model,
             min_count=max(1, int(args.noise_min_count)),
             bytes_min_count=max(1, int(args.noise_bytes_min_count)),
+            signature_min_ratio=max(0.0, min(1.0, float(args.noise_signature_min_ratio))),
         )
     else:
         if not args.events:
@@ -311,11 +381,17 @@ def main() -> int:
             alpha=args.alpha,
             min_graph_path_weight=args.min_graph_path_weight,
             min_path_factor=args.min_path_factor,
+            path_factor_op=args.path_factor_op,
             scoring_mode=args.scoring_mode,
             paper_weights=args.paper_weights,
             paper_mode=args.paper_mode,
+            prereq_policy=args.prereq_policy,
             noise_model_path=args.noise_model,
             noise_bytes_threshold=args.noise_bytes_threshold,
+            noise_signature_min_ratio=max(0.0, min(1.0, float(args.noise_signature_min_ratio))),
+            graph_path_allowlist=args.graph_path_allowlist,
+            max_graph_path_edges=args.max_graph_path_edges,
+            max_graph_path_candidates_per_match=args.max_graph_path_candidates_per_match,
         )
     return 0
 

@@ -7,6 +7,31 @@ from typing import Iterable
 from engine.io.events import Event
 
 
+def path_factor_passes(pf: float | None, threshold: float, op: str = "ge") -> bool:
+    """
+    Compare path_factor threshold with consistent semantics across pipeline modules.
+
+    - pf is None or pf <= 0.0 -> fail
+    - op == "ge": pf >= threshold
+    - op == "le": pf <= threshold
+    """
+    if pf is None:
+        return False
+    try:
+        pf_value = float(pf)
+        th_value = float(threshold)
+    except (TypeError, ValueError):
+        return False
+
+    if pf_value <= 0.0:
+        return False
+    if op == "ge":
+        return pf_value >= th_value
+    if op == "le":
+        return pf_value <= th_value
+    raise ValueError(f"Unsupported path_factor op: {op}")
+
+
 @dataclass(slots=True)
 class Edge:
     src: str

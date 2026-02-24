@@ -325,6 +325,26 @@ class ProvenanceGraph:
             self._path_factor_cache[src] = self._paper_path_factor_map(src)
         return self._path_factor_cache[src].get(dst, 0.0)
 
+    def path_factor_for_edge(self, src: str, dst: str) -> int | None:
+        """
+        Return path_factor normalized for graph_path edge serialization.
+
+        - Unreachable/sentinel (<=0) is normalized to None.
+        - Only integer path_factor >= 1 is accepted for edge emission.
+        """
+        pf = self.path_factor(src, dst)
+        if pf is None:
+            return None
+        try:
+            value = float(pf)
+        except (TypeError, ValueError):
+            return None
+        if value < 1.0:
+            return None
+        if not value.is_integer():
+            return None
+        return int(value)
+
     def path(self, src: str, dst: str) -> list[str] | None:
         """Return one shortest path from src to dst if it exists."""
         if src not in self.nodes or dst not in self.nodes:

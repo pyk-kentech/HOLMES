@@ -80,6 +80,13 @@ def filter_matches(matches: list[TTPMatch], config: NoiseConfig) -> list[TTPMatc
     return [m for m in matches if m.rule_id not in config.drop_rule_ids and m.match_id not in config.drop_match_ids]
 
 
+def passes_global_path_factor_pruning(edge: HSGEdge, config: NoiseConfig) -> bool:
+    return (
+        float(edge.weight or 0.0) >= config.min_graph_path_weight
+        and path_factor_passes(edge.path_factor, config.min_path_factor, config.path_factor_op)
+    )
+
+
 def filter_hsg(hsg: HSG, config: NoiseConfig) -> HSG:
     edges = [
         e
@@ -87,10 +94,7 @@ def filter_hsg(hsg: HSG, config: NoiseConfig) -> HSG:
         if e.relation not in config.drop_prerequisite_types
         and (
             e.relation != "graph_path"
-            or (
-                float(e.weight or 0.0) >= config.min_graph_path_weight
-                and path_factor_passes(e.path_factor, config.min_path_factor, config.path_factor_op)
-            )
+            or passes_global_path_factor_pruning(e, config)
         )
     ]
     return HSG(nodes=list(hsg.nodes), edges=edges)

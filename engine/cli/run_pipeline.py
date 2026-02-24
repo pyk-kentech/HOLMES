@@ -24,6 +24,33 @@ def _parse_paper_weights(raw: str) -> list[float]:
         raise ValueError("--paper-weights must contain valid floats") from exc
 
 
+def _resolve_effective_config(
+    *,
+    scoring_mode: str,
+    paper_mode: str,
+    paper_weights: str,
+    min_path_factor: float | None,
+    path_factor_op: str | None,
+) -> dict[str, object]:
+    if path_factor_op is not None and path_factor_op not in {"ge", "le"}:
+        raise ValueError("path_factor_op must be one of: ge, le")
+
+    if scoring_mode == "paper":
+        resolved_path_thres = 3.0 if min_path_factor is None else float(min_path_factor)
+        resolved_op = "le" if path_factor_op is None else path_factor_op
+    else:
+        resolved_path_thres = 0.0 if min_path_factor is None else float(min_path_factor)
+        resolved_op = "ge" if path_factor_op is None else path_factor_op
+
+    return {
+        "path_thres": resolved_path_thres,
+        "path_factor_op": resolved_op,
+        "scoring": scoring_mode,
+        "paper_mode": paper_mode,
+        "paper_weights": _parse_paper_weights(paper_weights),
+    }
+
+
 def run_pipeline(
     events_path: str,
     rules_path: str,
@@ -31,8 +58,8 @@ def run_pipeline(
     noise_path: str | None = None,
     alpha: float | None = None,
     min_graph_path_weight: float = 0.0,
-    min_path_factor: float = 0.0,
-    path_factor_op: str = "ge",
+    min_path_factor: float | None = None,
+    path_factor_op: str | None = None,
     scoring_mode: str = "legacy",
     paper_weights: str = "1.0,1.0,1.0,1.0,1.0,1.0,1.0",
     paper_mode: str = "hybrid",
@@ -44,11 +71,16 @@ def run_pipeline(
     max_graph_path_edges: int = 10000,
     max_graph_path_candidates_per_match: int = 200,
 ) -> dict:
-    if path_factor_op not in {"ge", "le"}:
-        raise ValueError("path_factor_op must be one of: ge, le")
     if prereq_policy not in {"dst_only", "union"}:
         raise ValueError("prereq_policy must be one of: dst_only, union")
     noise_signature_min_ratio = max(0.0, min(1.0, float(noise_signature_min_ratio)))
+    resolved_effective_config = _resolve_effective_config(
+        scoring_mode=scoring_mode,
+        paper_mode=paper_mode,
+        paper_weights=paper_weights,
+        min_path_factor=min_path_factor,
+        path_factor_op=path_factor_op,
+    )
 
     events = load_events_jsonl(events_path)
 
@@ -85,12 +117,14 @@ def run_pipeline(
             signature_min_ratio=noise_signature_min_ratio,
         )
 
-    if noise_path or min_graph_path_weight > 0.0 or min_path_factor > 0.0 or noise_model_path:
+    resolved_path_thres = float(resolved_effective_config["path_thres"])
+    resolved_path_factor_op = str(resolved_effective_config["path_factor_op"])
+    if noise_path or min_graph_path_weight > 0.0 or resolved_path_thres > 0.0 or noise_model_path:
         noise_config = load_noise_config(noise_path) if noise_path else NoiseConfig()
         noise_config.drop_match_ids = set(drop_match_ids)
         noise_config.min_graph_path_weight = max(noise_config.min_graph_path_weight, min_graph_path_weight)
-        noise_config.min_path_factor = max(noise_config.min_path_factor, min_path_factor)
-        noise_config.path_factor_op = path_factor_op
+        noise_config.min_path_factor = max(noise_config.min_path_factor, resolved_path_thres)
+        noise_config.path_factor_op = resolved_path_factor_op
         matches_after, hsg_after = apply_noise_filter(matches_before, hsg_before, noise_config)
     else:
         matches_after, hsg_after = matches_before, hsg_before
@@ -129,6 +163,13 @@ def run_pipeline(
         rule_cvss=rule_cvss,
         paper_weights=_parse_paper_weights(paper_weights),
     )
+    top1 = top_scenarios[0] if top_scenarios else {}
+    paper_scoring = {
+        "threat_tuple": top1.get("threat_tuple", []),
+        "stage_severity": top1.get("stage_severity", {}),
+        "paper_weights": top1.get("paper_weights", resolved_effective_config["paper_weights"]),
+        "score_paper": top1.get("score_paper", 1.0),
+    }
 
     result = {
         "summary": {
@@ -138,6 +179,8 @@ def run_pipeline(
             "hsg_nodes": len(hsg_after.nodes),
             "hsg_edges": len(hsg_after.edges),
             "noise_filter": noise_counts,
+            "resolved_effective_config": resolved_effective_config,
+            "paper_scoring": paper_scoring,
             "top_scenarios": top_scenarios,
         },
         "matches": [
@@ -296,15 +339,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--min-path-factor",
         dest="min_path_factor",
         type=float,
-        default=0.0,
-        help="Path-factor threshold value used with --path-factor-op (default: 0.0).",
+        default=None,
+        help=(
+            "Path-factor threshold. In paper mode this is interpreted as path_thres. "
+            "Resolver default is 3 only when scoring=paper and value is omitted."
+        ),
     )
     parser.add_argument(
         "--path-factor-op",
         dest="path_factor_op",
         choices=["ge", "le"],
-        default="ge",
-        help="Path-factor threshold direction: ge means pf>=threshold, le means pf<=threshold.",
+        default=None,
+        help=(
+            "Path-factor threshold direction. Resolver default is le for scoring=paper "
+            "and ge for scoring=legacy when omitted."
+        ),
     )
     parser.add_argument(
         "--scoring",

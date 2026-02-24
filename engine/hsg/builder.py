@@ -267,7 +267,7 @@ def build_hsg(
                             to_entity = right.bindings.get(to_binding)
                             if from_entity and to_entity:
                                 path_factor_reqs = path_factor_prerequisites_for_pair(left_rule, right_rule, prereq_policy)
-                                if any(
+                                if path_factor_reqs and any(
                                     not is_path_factor_satisfied(
                                         graph,
                                         from_entity,
@@ -280,7 +280,10 @@ def build_hsg(
                                     continue
                                 dependency = graph.dependency_strength(from_entity, to_entity)
                                 edge_dependency_strength = dependency
-                                edge_path_factor = graph.path_factor(from_entity, to_entity)
+                                edge_pf = graph.path_factor_for_edge(from_entity, to_entity)
+                                if edge_pf is None:
+                                    continue
+                                edge_path_factor = float(edge_pf)
                                 if paper_mode == "strict":
                                     weight = edge_path_factor
                                 else:

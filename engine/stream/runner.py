@@ -42,6 +42,7 @@ class StreamingEngine:
         graph_path_allowlist: set[tuple[str, str]] | None = None,
         max_graph_path_edges: int = 10000,
         max_graph_path_candidates_per_match: int = 200,
+        resolved_effective_config: dict[str, Any] | None = None,
     ) -> None:
         self.ruleset = ruleset
         self.scoring_mode = scoring_mode
@@ -56,6 +57,18 @@ class StreamingEngine:
         self.graph_path_allowlist = graph_path_allowlist
         self.max_graph_path_edges = max_graph_path_edges
         self.max_graph_path_candidates_per_match = max_graph_path_candidates_per_match
+        if resolved_effective_config is None:
+            default_path_thres = 3.0 if scoring_mode == "paper" else 0.0
+            default_path_factor_op = "le" if scoring_mode == "paper" else "ge"
+            self.resolved_effective_config = {
+                "path_thres": default_path_thres,
+                "path_factor_op": default_path_factor_op,
+                "scoring": scoring_mode,
+                "paper_mode": paper_mode,
+                "paper_weights": list(paper_weights) if paper_weights is not None else [1.0] * 7,
+            }
+        else:
+            self.resolved_effective_config = dict(resolved_effective_config)
 
         self.graph = ProvenanceGraph()
         self.matcher = Matcher()
@@ -149,7 +162,7 @@ class StreamingEngine:
                 if not from_entity or not to_entity:
                     continue
                 path_factor_reqs = hsg_builder.path_factor_prerequisites_for_pair(left_rule, right_rule, self.prereq_policy)
-                if any(
+                if path_factor_reqs and any(
                     not is_path_factor_satisfied(
                         self.graph,
                         from_entity,
@@ -162,7 +175,10 @@ class StreamingEngine:
                     continue
                 dependency = self.graph.dependency_strength(from_entity, to_entity)
                 edge_dependency_strength = dependency
-                edge_path_factor = self.graph.path_factor(from_entity, to_entity)
+                edge_pf = self.graph.path_factor_for_edge(from_entity, to_entity)
+                if edge_pf is None:
+                    continue
+                edge_path_factor = float(edge_pf)
                 if self.paper_mode == "strict":
                     weight = edge_path_factor
                 else:
@@ -278,6 +294,13 @@ class StreamingEngine:
             "by_byte_volume": self.stats.by_byte_volume,
             "byte_volume_by_rule_id": self.stats.byte_volume_by_rule_id or {},
         }
+        top1 = self.top_scenarios[0] if self.top_scenarios else {}
+        paper_scoring = {
+            "threat_tuple": top1.get("threat_tuple", []),
+            "stage_severity": top1.get("stage_severity", {}),
+            "paper_weights": top1.get("paper_weights", self.resolved_effective_config.get("paper_weights", [1.0] * 7)),
+            "score_paper": top1.get("score_paper", 1.0),
+        }
         return {
             "summary": {
                 "events": self.stats.events,
@@ -286,6 +309,8 @@ class StreamingEngine:
                 "hsg_nodes": len(hsg.nodes),
                 "hsg_edges": len(hsg.edges),
                 "noise_filter": noise_filter,
+                "resolved_effective_config": self.resolved_effective_config,
+                "paper_scoring": paper_scoring,
                 "top_scenarios": self.top_scenarios,
             },
             "matches": [

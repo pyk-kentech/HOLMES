@@ -3,21 +3,12 @@ from __future__ import annotations
 import argparse
 import time
 
+from engine.cli.run_pipeline import _parse_paper_weights, _resolve_effective_config
 from engine.hsg.builder import load_graph_path_allowlist
 from engine.noise.model import load_noise_model
 from engine.rules.schema import load_rules_yaml
 from engine.stream.runner import StreamingEngine
 from engine.stream.source import FileJsonlSource
-
-
-def _parse_paper_weights(raw: str) -> list[float]:
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) != 7:
-        raise ValueError("--paper-weights must contain exactly 7 comma-separated floats")
-    try:
-        return [float(p) for p in parts]
-    except ValueError as exc:
-        raise ValueError("--paper-weights must contain valid floats") from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -27,9 +18,46 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", "--output", dest="out", required=True, help="Path to output snapshot directory")
     parser.add_argument("--follow", action="store_true", help="Follow the JSONL file as it grows (tail -f style).")
     parser.add_argument("--alpha", dest="alpha", type=float, default=None, help="Legacy weighted-scenario alpha override.")
-    parser.add_argument("--scoring", dest="scoring_mode", choices=["legacy", "paper"], default="legacy")
-    parser.add_argument("--paper-weights", dest="paper_weights", default="1,1,1,1,1,1,1")
-    parser.add_argument("--paper-mode", dest="paper_mode", choices=["hybrid", "strict"], default="hybrid")
+    parser.add_argument(
+        "--scoring",
+        dest="scoring_mode",
+        choices=["legacy", "paper"],
+        default="legacy",
+        help="Scenario scoring mode (legacy additive or paper weighted-product).",
+    )
+    parser.add_argument(
+        "--paper-weights",
+        dest="paper_weights",
+        default="1,1,1,1,1,1,1",
+        help="Comma-separated 7 floats for paper weighted-product scoring.",
+    )
+    parser.add_argument(
+        "--paper-mode",
+        dest="paper_mode",
+        choices=["hybrid", "strict"],
+        default="hybrid",
+        help="graph_path edge-weight mode: hybrid=dependency_strength*path_factor, strict=path_factor.",
+    )
+    parser.add_argument(
+        "--min-path-factor",
+        dest="min_path_factor",
+        type=float,
+        default=None,
+        help=(
+            "Path-factor threshold. In paper mode this is interpreted as path_thres. "
+            "Resolver default is 3 only when scoring=paper and value is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--path-factor-op",
+        dest="path_factor_op",
+        choices=["ge", "le"],
+        default=None,
+        help=(
+            "Path-factor threshold direction. Resolver default is le for scoring=paper "
+            "and ge for scoring=legacy when omitted."
+        ),
+    )
     parser.add_argument(
         "--prereq-policy",
         dest="prereq_policy",
@@ -85,14 +113,22 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _build_parser().parse_args()
+    resolved_effective_config = _resolve_effective_config(
+        scoring_mode=args.scoring_mode,
+        paper_mode=args.paper_mode,
+        paper_weights=args.paper_weights,
+        min_path_factor=args.min_path_factor,
+        path_factor_op=args.path_factor_op,
+    )
     ruleset = load_rules_yaml(args.rules)
     noise_model = load_noise_model(args.noise_model) if args.noise_model else None
     allowlist = load_graph_path_allowlist(args.graph_path_allowlist)
     engine = StreamingEngine(
         ruleset=ruleset,
-        scoring_mode=args.scoring_mode,
-        paper_weights=_parse_paper_weights(args.paper_weights),
-        paper_mode=args.paper_mode,
+        scoring_mode=str(resolved_effective_config["scoring"]),
+        paper_weights=list(resolved_effective_config["paper_weights"]),
+        paper_mode=str(resolved_effective_config["paper_mode"]),
+        resolved_effective_config=resolved_effective_config,
         prereq_policy=args.prereq_policy,
         alpha=args.alpha,
         noise_model=noise_model,

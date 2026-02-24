@@ -98,7 +98,7 @@ def _build_threat_tuple(
 def _paper_score_from_tuple(threat_tuple: list[float], paper_weights: list[float] | None) -> float:
     weights = list(paper_weights) if paper_weights is not None else [1.0] * len(APT_STAGES)
     if len(weights) != len(APT_STAGES):
-        raise ValueError("paper_weights must contain exactly 7 floats")
+        raise ValueError("paper_weights must contain exactly 7 values")
 
     score = 1.0
     for s_i, w_i in zip(threat_tuple, weights):
@@ -129,6 +129,8 @@ def rank_hsg_scenarios(
     """
     if score_mode not in {"legacy", "paper"}:
         raise ValueError("score_mode must be 'legacy' or 'paper'")
+    if paper_weights is not None and len(paper_weights) != len(APT_STAGES):
+        raise ValueError("paper_weights must contain exactly 7 values")
 
     components = _connected_components(hsg)
     rule_id_by_match = {n.match_id: n.rule_id for n in hsg.nodes}
@@ -142,12 +144,15 @@ def rank_hsg_scenarios(
         threat_tuple = _build_threat_tuple(comp, rule_id_by_match, rule_cvss, rule_stage, rule_severity)
         score_paper = _paper_score_from_tuple(threat_tuple, paper_weights)
         score = score_paper if score_mode == "paper" else score_legacy
+        stage_severity = {APT_STAGES[i]: float(threat_tuple[i]) for i in range(len(APT_STAGES))}
         scenarios.append(
             {
                 "score": float(score),
                 "score_legacy": float(score_legacy),
                 "score_paper": float(score_paper),
                 "threat_tuple": threat_tuple,
+                "stage_severity": stage_severity,
+                "paper_weights": list(paper_weights) if paper_weights is not None else [1.0] * len(APT_STAGES),
                 "nodes": len(comp),
                 "edges": edge_count,
             }
@@ -165,6 +170,8 @@ def rank_hsg_scenarios(
                 "score_legacy": score_legacy,
                 "score_paper": score_paper,
                 "threat_tuple": [0.0] * len(APT_STAGES),
+                "stage_severity": {APT_STAGES[i]: 0.0 for i in range(len(APT_STAGES))},
+                "paper_weights": list(paper_weights) if paper_weights is not None else [1.0] * len(APT_STAGES),
                 "nodes": 0,
                 "edges": 0,
             }

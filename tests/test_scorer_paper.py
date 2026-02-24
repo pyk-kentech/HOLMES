@@ -89,3 +89,53 @@ def test_paper_score_matches_manual_weighted_product():
 
     expected = (1.0 + 2.0 / 10.0) ** 1.0 * (1.0 + 8.0 / 10.0) ** 2.0
     assert abs(float(score) - expected) <= 1e-9
+
+
+def test_paper_weights_length_validation_in_scorer():
+    hsg = HSG(nodes=[HSGNode(match_id="m1", rule_id="r1")], edges=[])
+    try:
+        rank_hsg_scenarios(
+            hsg,
+            score_mode="paper",
+            rule_stage={"r1": 1},
+            rule_cvss={"r1": 6.0},
+            paper_weights=[1.0] * 6,
+            top_k=1,
+        )
+    except ValueError as exc:
+        assert str(exc) == "paper_weights must contain exactly 7 values"
+    else:
+        raise AssertionError("Expected ValueError for invalid paper_weights length")
+
+
+def test_paper_score_golden_exact_sample_fixture(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    events_path = repo_root / "experiments" / "sample.jsonl"
+    rules_path = repo_root / "rules" / "test_rules.yaml"
+    result = run_pipeline(
+        str(events_path),
+        str(rules_path),
+        str(tmp_path / "out_paper_golden"),
+        scoring_mode="paper",
+        paper_mode="strict",
+    )
+    assert result["summary"]["top_scenarios"][0]["score_paper"] == 4.032
+
+
+def test_summary_exposes_paper_scoring_fields(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    events_path = repo_root / "experiments" / "sample.jsonl"
+    rules_path = repo_root / "rules" / "test_rules.yaml"
+    result = run_pipeline(
+        str(events_path),
+        str(rules_path),
+        str(tmp_path / "out_paper_fields"),
+        scoring_mode="paper",
+        paper_mode="strict",
+        paper_weights="1.1,1.2,1.3,1.4,1.5,1.6,1.7",
+    )
+    ps = result["summary"]["paper_scoring"]
+    assert "threat_tuple" in ps
+    assert "stage_severity" in ps
+    assert "paper_weights" in ps
+    assert "score_paper" in ps

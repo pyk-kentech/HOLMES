@@ -22,6 +22,23 @@ python -m engine.cli.run_pipeline \
   --out out
 ```
 
+## Paper mode recommended command
+
+```bash
+python -m engine.cli.run_pipeline \
+  --events <events.jsonl> \
+  --rules <rules.yaml> \
+  --out out \
+  --paper-mode strict \
+  --path-factor-op le \
+  --min-path-factor 3 \
+  --prereq-policy dst_only \
+  --scoring paper \
+  --paper-weights 1.1,1.2,1.3,1.4,1.5,1.6,1.7 \
+  --noise-model noise_model.json \
+  --noise-bytes-threshold p95
+```
+
 ## Rule schema
 
 `event_predicate` supports exactly one of:
@@ -59,4 +76,12 @@ When multiple paths exist, the minimum propagated value is used.
 Legacy MAC approximation remains available as `path_factor_legacy_mac(...)`.
 For threshold filtering, `--path-factor-op ge` means keep edges with `path_factor >= threshold` (legacy behavior).
 `--path-factor-op le` means keep edges with `path_factor <= threshold` (paper-style max allowed path_factor).
-In strict paper experiments, use `--paper-mode strict --path-factor-op le` to suppress weak/high-cost links.
+In paper mode, `--min-path-factor` is interpreted as `path_thres` (the option name is kept for compatibility).
+Default `path_thres=3` is applied only by the mode resolver when scoring mode is `paper` and the option is omitted.
+`--path-factor-op` default is also resolved by mode: `paper -> le`, `legacy -> ge`.
+
+## Summary fields
+
+`summary.json` includes:
+- `resolved_effective_config`: resolved runtime config values after mode resolver (`path_thres`, `path_factor_op`, `scoring`, `paper_mode`, `paper_weights`)
+- `paper_scoring`: paper scoring visibility fields (`threat_tuple`, `stage_severity`, `paper_weights`, `score_paper`)

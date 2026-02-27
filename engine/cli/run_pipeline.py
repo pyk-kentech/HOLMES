@@ -6,12 +6,12 @@ from pathlib import Path
 
 from engine.core.graph import ProvenanceGraph
 from engine.core.matcher import Matcher
-from engine.hsg.builder import build_hsg, hsg_to_dict, load_graph_path_allowlist
-from engine.hsg.scorer import rank_hsg_scenarios
+from engine.hsg.builder import load_graph_path_allowlist
 from engine.io.events import load_events_jsonl
-from engine.noise.filter import NoiseConfig, apply_noise_filter, build_noise_counts, load_noise_config
-from engine.noise.model import get_benign_drop_ids, load_noise_model, save_noise_model, train_noise_model
-from engine.rules.schema import infer_rule_cvss, infer_rule_stage, load_rules_yaml
+from engine.noise.filter import NoiseConfig, apply_noise_filter, load_noise_config
+from engine.noise.model import load_noise_model, save_noise_model, train_noise_model
+from engine.rules.schema import load_rules_yaml
+from engine.stream.runner import StreamingEngine
 
 
 def _parse_paper_weights(raw: str) -> list[float]:
@@ -29,26 +29,30 @@ def _resolve_effective_config(
     scoring_mode: str,
     paper_mode: str,
     paper_weights: str,
+    tau: float | None,
     min_path_factor: float | None,
     path_factor_op: str | None,
 ) -> dict[str, object]:
     if path_factor_op is not None and path_factor_op not in {"ge", "le"}:
         raise ValueError("path_factor_op must be one of: ge, le")
 
-    if scoring_mode == "paper":
+    if scoring_mode in {"paper", "paper_exact"}:
         resolved_path_thres = 3.0 if min_path_factor is None else float(min_path_factor)
         resolved_op = "le" if path_factor_op is None else path_factor_op
     else:
         resolved_path_thres = 0.0 if min_path_factor is None else float(min_path_factor)
         resolved_op = "ge" if path_factor_op is None else path_factor_op
 
-    return {
+    out = {
         "path_thres": resolved_path_thres,
         "path_factor_op": resolved_op,
         "scoring": scoring_mode,
         "paper_mode": paper_mode,
         "paper_weights": _parse_paper_weights(paper_weights),
     }
+    if tau is not None:
+        out["tau"] = float(tau)
+    return out
 
 
 def run_pipeline(
@@ -62,6 +66,7 @@ def run_pipeline(
     path_factor_op: str | None = None,
     scoring_mode: str = "legacy",
     paper_weights: str = "1.0,1.0,1.0,1.0,1.0,1.0,1.0",
+    tau: float | None = None,
     paper_mode: str = "hybrid",
     prereq_policy: str = "union",
     noise_model_path: str | None = None,
@@ -70,6 +75,7 @@ def run_pipeline(
     graph_path_allowlist: str | None = "none",
     max_graph_path_edges: int = 10000,
     max_graph_path_candidates_per_match: int = 200,
+    use_online_prereq: bool = False,
 ) -> dict:
     if prereq_policy not in {"dst_only", "union"}:
         raise ValueError("prereq_policy must be one of: dst_only, union")
@@ -78,134 +84,55 @@ def run_pipeline(
         scoring_mode=scoring_mode,
         paper_mode=paper_mode,
         paper_weights=paper_weights,
+        tau=tau,
         min_path_factor=min_path_factor,
         path_factor_op=path_factor_op,
     )
 
     events = load_events_jsonl(events_path)
-
-    graph = ProvenanceGraph()
-    graph.add_events(events)
-
     ruleset = load_rules_yaml(rules_path)
-    matcher = Matcher()
-    matches_before = matcher.match(graph=graph, ruleset=ruleset, events=events)
     allowlist = load_graph_path_allowlist(graph_path_allowlist)
-    hsg_before = build_hsg(
-        matches_before,
-        graph,
-        ruleset,
+    noise_model = load_noise_model(noise_model_path) if noise_model_path else None
+    engine = StreamingEngine(
+        ruleset=ruleset,
+        scoring_mode=scoring_mode,
+        paper_weights=_parse_paper_weights(paper_weights),
+        tau=tau,
         paper_mode=paper_mode,
         prereq_policy=prereq_policy,
+        alpha=alpha,
+        noise_model=noise_model,
+        noise_bytes_threshold=noise_bytes_threshold,
+        noise_signature_min_ratio=noise_signature_min_ratio,
         graph_path_allowlist=allowlist,
         max_graph_path_edges=max_graph_path_edges,
         max_graph_path_candidates_per_match=max_graph_path_candidates_per_match,
+        use_online_prereq=use_online_prereq,
+        resolved_effective_config=resolved_effective_config,
+        global_refine_mode="off",
     )
-    rule_by_id = {r.rule_id: r for r in ruleset.rules}
-    events_by_id = {e.event_id: e for e in events}
-    trained_noise_stats = {"by_signature": 0, "by_byte_volume": 0}
-    drop_match_ids: set[str] = set()
-
-    if noise_model_path:
-        noise_model = load_noise_model(noise_model_path)
-        drop_match_ids, trained_noise_stats = get_benign_drop_ids(
-            matches_before,
-            rule_by_id=rule_by_id,
-            model=noise_model,
-            events_by_id=events_by_id,
-            bytes_threshold=noise_bytes_threshold,
-            signature_min_ratio=noise_signature_min_ratio,
-        )
+    for ev in events:
+        engine.process_event(ev)
 
     resolved_path_thres = float(resolved_effective_config["path_thres"])
     resolved_path_factor_op = str(resolved_effective_config["path_factor_op"])
-    if noise_path or min_graph_path_weight > 0.0 or resolved_path_thres > 0.0 or noise_model_path:
+    if noise_path or min_graph_path_weight > 0.0 or resolved_path_thres > 0.0:
+        before_hsg = engine.current_hsg()
         noise_config = load_noise_config(noise_path) if noise_path else NoiseConfig()
-        noise_config.drop_match_ids = set(drop_match_ids)
         noise_config.min_graph_path_weight = max(noise_config.min_graph_path_weight, min_graph_path_weight)
         noise_config.min_path_factor = max(noise_config.min_path_factor, resolved_path_thres)
         noise_config.path_factor_op = resolved_path_factor_op
-        matches_after, hsg_after = apply_noise_filter(matches_before, hsg_before, noise_config)
-    else:
-        matches_after, hsg_after = matches_before, hsg_before
+        matches_after, hsg_after = apply_noise_filter(engine.matches, before_hsg, noise_config)
+        engine._replace_state_from_filtered(  # noqa: SLF001
+            matches_after,
+            hsg_after,
+            before_matches=len(engine.matches),
+            before_nodes=len(before_hsg.nodes),
+            before_edges=len(before_hsg.edges),
+        )
+        engine._refresh_scores()  # noqa: SLF001
 
-    noise_counts = build_noise_counts(
-        before_matches=len(matches_before),
-        before_nodes=len(hsg_before.nodes),
-        before_edges=len(hsg_before.edges),
-        after_matches=len(matches_after),
-        after_nodes=len(hsg_after.nodes),
-        after_edges=len(hsg_after.edges),
-    )
-    if noise_model_path:
-        noise_counts["trained_noise"] = {
-            "dropped_matches": len(drop_match_ids),
-            **trained_noise_stats,
-        }
-    rule_severity = {r.rule_id: r.severity for r in ruleset.rules}
-    # Priority: rules.yaml scoring.alpha > CLI --alpha > default 1.0
-    if ruleset.has_scoring_alpha:
-        scoring_alpha = ruleset.scoring_alpha
-    elif alpha is not None:
-        scoring_alpha = alpha
-    else:
-        scoring_alpha = 1.0
-    rule_stage = {r.rule_id: infer_rule_stage(r) for r in ruleset.rules}
-    rule_cvss = {r.rule_id: infer_rule_cvss(r) for r in ruleset.rules}
-    top_scenarios = rank_hsg_scenarios(
-        hsg_after,
-        scoring="weighted",
-        rule_severity=rule_severity,
-        alpha=scoring_alpha,
-        top_k=3,
-        score_mode=scoring_mode,
-        rule_stage=rule_stage,
-        rule_cvss=rule_cvss,
-        paper_weights=_parse_paper_weights(paper_weights),
-    )
-    top1 = top_scenarios[0] if top_scenarios else {}
-    paper_scoring = {
-        "threat_tuple": top1.get("threat_tuple", []),
-        "stage_severity": top1.get("stage_severity", {}),
-        "paper_weights": top1.get("paper_weights", resolved_effective_config["paper_weights"]),
-        "score_paper": top1.get("score_paper", 1.0),
-    }
-
-    result = {
-        "summary": {
-            "events": len(events),
-            "rules": len(ruleset.rules),
-            "matches": len(matches_after),
-            "hsg_nodes": len(hsg_after.nodes),
-            "hsg_edges": len(hsg_after.edges),
-            "noise_filter": noise_counts,
-            "resolved_effective_config": resolved_effective_config,
-            "paper_scoring": paper_scoring,
-            "top_scenarios": top_scenarios,
-        },
-        "matches": [
-            {
-                "match_id": m.match_id,
-                "rule_id": m.rule_id,
-                "event_ids": m.event_ids,
-                "entities": m.entities,
-                "bindings": m.bindings,
-                "metadata": m.metadata,
-            }
-            for m in matches_after
-        ],
-        "hsg": hsg_to_dict(hsg_after),
-    }
-
-    output_dir = Path(output_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    (output_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    (output_dir / "summary.json").write_text(json.dumps(result["summary"], indent=2), encoding="utf-8")
-    (output_dir / "matches.json").write_text(json.dumps(result["matches"], indent=2), encoding="utf-8")
-    (output_dir / "hsg.json").write_text(json.dumps(result["hsg"], indent=2), encoding="utf-8")
-
-    return result
+    return engine.write_snapshot(output_path)
 
 
 def train_noise_model_pipeline(
@@ -341,8 +268,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Path-factor threshold. In paper mode this is interpreted as path_thres. "
-            "Resolver default is 3 only when scoring=paper and value is omitted."
+            "Path-factor threshold. In paper/paper_exact mode this is interpreted as path_thres. "
+            "Resolver default is 3 only when scoring is paper-like and value is omitted."
         ),
     )
     parser.add_argument(
@@ -351,22 +278,29 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["ge", "le"],
         default=None,
         help=(
-            "Path-factor threshold direction. Resolver default is le for scoring=paper "
-            "and ge for scoring=legacy when omitted."
+            "Path-factor threshold direction. Resolver default is le for paper-like scoring "
+            "and ge for legacy when omitted."
         ),
     )
     parser.add_argument(
         "--scoring",
         dest="scoring_mode",
-        choices=["legacy", "paper"],
+        choices=["legacy", "paper", "paper_exact"],
         default="legacy",
-        help="Scenario scoring mode (legacy additive or paper weighted-product).",
+        help="Scenario scoring mode (legacy additive, paper approximate, or paper_exact weighted-product).",
     )
     parser.add_argument(
         "--paper-weights",
         dest="paper_weights",
         default="1.0,1.0,1.0,1.0,1.0,1.0,1.0",
         help="Comma-separated 7 floats for paper weighted-product scoring.",
+    )
+    parser.add_argument(
+        "--tau",
+        dest="tau",
+        type=float,
+        default=None,
+        help="Detection threshold tau for paper_exact mode. Alert when score >= tau.",
     )
     parser.add_argument(
         "--paper-mode",
@@ -402,6 +336,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=200,
         help="Maximum graph_path destination candidates evaluated per source match (default: 200).",
     )
+    parser.add_argument(
+        "--use-online-prereq",
+        dest="use_online_prereq",
+        action="store_true",
+        help="Use online prerequisite/index propagation path (default off for legacy compatibility).",
+    )
     return parser
 
 
@@ -433,6 +373,7 @@ def main() -> int:
             path_factor_op=args.path_factor_op,
             scoring_mode=args.scoring_mode,
             paper_weights=args.paper_weights,
+            tau=args.tau,
             paper_mode=args.paper_mode,
             prereq_policy=args.prereq_policy,
             noise_model_path=args.noise_model,
@@ -441,6 +382,7 @@ def main() -> int:
             graph_path_allowlist=args.graph_path_allowlist,
             max_graph_path_edges=args.max_graph_path_edges,
             max_graph_path_candidates_per_match=args.max_graph_path_candidates_per_match,
+            use_online_prereq=bool(args.use_online_prereq),
         )
     return 0
 

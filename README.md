@@ -39,6 +39,51 @@ python -m engine.cli.run_pipeline \
   --noise-bytes-threshold p95
 ```
 
+## Reproducible experiment run (Step 5)
+
+Single command:
+
+```bash
+python -m experiments.run --config experiments/config_example.yaml
+```
+
+The experiment runner always uses `paper_exact` scoring and produces:
+- `results/<config_hash>/metrics.json`
+- `results/<config_hash>/detections.csv`
+- `results/<config_hash>/campaigns.json`
+- `results/<config_hash>/config_used.json`
+
+`metrics.json` includes campaign-level metrics (`precision/recall/f1`, TP/FP/TN/FN), early-detection context, latency/throughput, peak memory (when enabled), and config metadata (`config_hash`, `config_path`, `seed`, `tau`, `weights`).
+
+`detections.csv` has one row per campaign window with:
+- `campaign_id`, `label`
+- `campaign_start_event`, `campaign_end_event`
+- `detected`, `detect_event`, `score_at_detect`
+- `Stage-to-Detect`, `Events-to-Detect`
+- `tuple_snapshot_at_detect`, `contributing_stages_at_detect`
+
+Memory profiling is separated from latency/throughput measurement via an independent runner pass.
+
+## Paper Anchors (Step 6)
+
+`paper_exact` experiments now resolve parameters from:
+- `configs/paper_defaults.yaml`: only values explicitly stated in paper (with page/section source)
+- `configs/assumptions.yaml`: only non-explicit fallback assumptions with `WHY`/`IMPACT`
+- `docs/paper_parameters.md`: drift guard table for paper/assumption keys
+
+Guardrails (fail-fast):
+- assumptions cannot override explicit paper defaults (`tau`, `weights`, `stage_order`)
+- missing `tau` or `weights` in both layers fails
+- `paper_defaults` entries require `source.page` and cannot include `WHY`/`IMPACT`
+- stage order must match code stage definition exactly
+- docs key table must match YAML keys
+
+`metrics.json` includes provenance metadata:
+- `paper_defaults_path`, `paper_defaults_digest`
+- `assumptions_path`, `assumptions_digest`
+- `stage_order_digest`
+- `parameter_provenance` (structured, with paper page/section or assumption WHY/IMPACT)
+
 ## Rule schema
 
 `event_predicate` supports exactly one of:
@@ -70,7 +115,8 @@ Edges without a `weight` field contribute 0.
 ## Path factor (MAC MVP)
 
 Default `path_factor(from_entity, to_entity)` follows paper-style incremental propagation.
-If no directed path exists, path_factor is `0.0`, and `path_factor(src, src) = 1.0`.
+If no directed path exists, path_factor is undefined (`None`), and `path_factor(src, src) = 1.0`.
+When unreachable, `graph_path` edges are not created.
 Process-node transitions without common ancestor with `src` increase path_factor by 1; non-process transitions keep it.
 When multiple paths exist, the minimum propagated value is used.
 Legacy MAC approximation remains available as `path_factor_legacy_mac(...)`.

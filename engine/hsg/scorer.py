@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import math
 
 from engine.hsg.builder import HSG
 from engine.rules.schema import APT_STAGES
@@ -70,6 +71,28 @@ def _to_cvss_severity(value: float | str | None) -> float:
     return float(value)
 
 
+def _to_paper_stage_severity(value: float | str | None) -> float:
+    if value is None:
+        return 2.0
+    if isinstance(value, str):
+        mapping = {
+            "low": 2.0,
+            "medium": 6.0,
+            "high": 8.0,
+            "critical": 10.0,
+        }
+        return float(mapping.get(value.lower(), 2.0))
+
+    x = float(value)
+    if x < 4.0:
+        return 2.0
+    if x < 7.0:
+        return 6.0
+    if x < 9.0:
+        return 8.0
+    return 10.0
+
+
 def _build_threat_tuple(
     node_ids: set[str],
     rule_id_by_match: dict[str, str],
@@ -108,6 +131,41 @@ def _paper_score_from_tuple(threat_tuple: list[float], paper_weights: list[float
     return float(score)
 
 
+def _build_threat_tuple_exact(
+    node_ids: set[str],
+    rule_id_by_match: dict[str, str],
+    rule_cvss: dict[str, float | str] | None,
+    rule_stage: dict[str, int] | None,
+    rule_severity: dict[str, float | str] | None = None,
+) -> list[float]:
+    cvss_by_rule = rule_cvss or {}
+    sev_by_rule = rule_severity or {}
+    stages = rule_stage or {}
+
+    t = [1.0] * len(APT_STAGES)
+    for mid in node_ids:
+        rule_id = rule_id_by_match[mid]
+        stage = int(stages.get(rule_id, 1))
+        idx = max(1, min(stage, len(APT_STAGES))) - 1
+        raw_score = cvss_by_rule.get(rule_id)
+        if raw_score is None:
+            raw_score = sev_by_rule.get(rule_id, 1.0)
+        score = _to_paper_stage_severity(raw_score)
+        if score > t[idx]:
+            t[idx] = score
+    return t
+
+
+def _paper_exact_score_from_tuple(threat_tuple: list[float], paper_weights: list[float] | None) -> tuple[float, float]:
+    weights = list(paper_weights) if paper_weights is not None else [1.0] * len(APT_STAGES)
+    if len(weights) != len(APT_STAGES):
+        raise ValueError("paper_weights must contain exactly 7 values")
+    log_score = 0.0
+    for s_i, w_i in zip(threat_tuple, weights):
+        log_score += float(w_i) * math.log(float(s_i))
+    return float(math.exp(log_score)), float(log_score)
+
+
 def rank_hsg_scenarios(
     hsg: HSG,
     scoring: str = "weighted",
@@ -127,8 +185,8 @@ def rank_hsg_scenarios(
       - severity: sum of node rule severities
       - weighted: sum(rule severities in component) + alpha * sum(edge.weight in component)
     """
-    if score_mode not in {"legacy", "paper"}:
-        raise ValueError("score_mode must be 'legacy' or 'paper'")
+    if score_mode not in {"legacy", "paper", "paper_exact"}:
+        raise ValueError("score_mode must be 'legacy', 'paper', or 'paper_exact'")
     if paper_weights is not None and len(paper_weights) != len(APT_STAGES):
         raise ValueError("paper_weights must contain exactly 7 values")
 
@@ -143,10 +201,19 @@ def rank_hsg_scenarios(
         score_legacy = _score_component(comp, edge_count, edge_score, rule_id_by_match, scoring, rule_severity, alpha)
         threat_tuple = _build_threat_tuple(comp, rule_id_by_match, rule_cvss, rule_stage, rule_severity)
         score_paper = _paper_score_from_tuple(threat_tuple, paper_weights)
-        score = score_paper if score_mode == "paper" else score_legacy
+        threat_tuple_exact = _build_threat_tuple_exact(comp, rule_id_by_match, rule_cvss, rule_stage, rule_severity)
+        score_paper_exact, score_paper_exact_log = _paper_exact_score_from_tuple(threat_tuple_exact, paper_weights)
+        if score_mode == "paper":
+            score = score_paper
+        elif score_mode == "paper_exact":
+            score = score_paper_exact
+        else:
+            score = score_legacy
         stage_severity = {APT_STAGES[i]: float(threat_tuple[i]) for i in range(len(APT_STAGES))}
+        stage_severity_exact = {APT_STAGES[i]: float(threat_tuple_exact[i]) for i in range(len(APT_STAGES))}
         scenarios.append(
-            {
+            (
+                {
                 "score": float(score),
                 "score_legacy": float(score_legacy),
                 "score_paper": float(score_paper),
@@ -155,7 +222,18 @@ def rank_hsg_scenarios(
                 "paper_weights": list(paper_weights) if paper_weights is not None else [1.0] * len(APT_STAGES),
                 "nodes": len(comp),
                 "edges": edge_count,
-            }
+                }
+                | (
+                    {
+                        "score_paper_exact": float(score_paper_exact),
+                        "score_paper_exact_log": float(score_paper_exact_log),
+                        "threat_tuple_exact": threat_tuple_exact,
+                        "stage_severity_exact": stage_severity_exact,
+                    }
+                    if score_mode == "paper_exact"
+                    else {}
+                )
+            )
         )
 
     scenarios.sort(key=lambda x: (float(x["score"]), int(x["nodes"]), int(x["edges"])), reverse=True)
@@ -163,9 +241,17 @@ def rank_hsg_scenarios(
     while len(scenarios) < top_k:
         score_legacy = 0.0
         score_paper = 1.0
-        score = score_paper if score_mode == "paper" else score_legacy
+        score_paper_exact = 1.0
+        score_paper_exact_log = 0.0
+        if score_mode == "paper":
+            score = score_paper
+        elif score_mode == "paper_exact":
+            score = score_paper_exact
+        else:
+            score = score_legacy
         scenarios.append(
-            {
+            (
+                {
                 "score": score,
                 "score_legacy": score_legacy,
                 "score_paper": score_paper,
@@ -174,6 +260,17 @@ def rank_hsg_scenarios(
                 "paper_weights": list(paper_weights) if paper_weights is not None else [1.0] * len(APT_STAGES),
                 "nodes": 0,
                 "edges": 0,
-            }
+                }
+                | (
+                    {
+                        "score_paper_exact": score_paper_exact,
+                        "score_paper_exact_log": score_paper_exact_log,
+                        "threat_tuple_exact": [1.0] * len(APT_STAGES),
+                        "stage_severity_exact": {APT_STAGES[i]: 1.0 for i in range(len(APT_STAGES))},
+                    }
+                    if score_mode == "paper_exact"
+                    else {}
+                )
+            )
         )
     return scenarios

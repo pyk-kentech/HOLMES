@@ -21,15 +21,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scoring",
         dest="scoring_mode",
-        choices=["legacy", "paper"],
+        choices=["legacy", "paper", "paper_exact"],
         default="legacy",
-        help="Scenario scoring mode (legacy additive or paper weighted-product).",
+        help="Scenario scoring mode (legacy additive, paper approximate, or paper_exact weighted-product).",
     )
     parser.add_argument(
         "--paper-weights",
         dest="paper_weights",
         default="1,1,1,1,1,1,1",
         help="Comma-separated 7 floats for paper weighted-product scoring.",
+    )
+    parser.add_argument(
+        "--tau",
+        dest="tau",
+        type=float,
+        default=None,
+        help="Detection threshold tau for paper_exact mode. Alert when score >= tau.",
     )
     parser.add_argument(
         "--paper-mode",
@@ -44,8 +51,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Path-factor threshold. In paper mode this is interpreted as path_thres. "
-            "Resolver default is 3 only when scoring=paper and value is omitted."
+            "Path-factor threshold. In paper/paper_exact mode this is interpreted as path_thres. "
+            "Resolver default is 3 only when scoring is paper-like and value is omitted."
         ),
     )
     parser.add_argument(
@@ -54,8 +61,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["ge", "le"],
         default=None,
         help=(
-            "Path-factor threshold direction. Resolver default is le for scoring=paper "
-            "and ge for scoring=legacy when omitted."
+            "Path-factor threshold direction. Resolver default is le for paper-like scoring "
+            "and ge for legacy when omitted."
         ),
     )
     parser.add_argument(
@@ -108,6 +115,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="When --follow, force periodic snapshots after this interval.",
     )
+    parser.add_argument(
+        "--global-refine",
+        dest="global_refine",
+        choices=["off", "snapshot", "every_n_events"],
+        default="off",
+        help="Optional global refinement trigger mode for streaming state (default: off).",
+    )
+    parser.add_argument(
+        "--global-refine-every",
+        dest="global_refine_every",
+        type=int,
+        default=1000,
+        help="Event interval used only when --global-refine every_n_events (default: 1000).",
+    )
     return parser
 
 
@@ -117,6 +138,7 @@ def main() -> int:
         scoring_mode=args.scoring_mode,
         paper_mode=args.paper_mode,
         paper_weights=args.paper_weights,
+        tau=args.tau,
         min_path_factor=args.min_path_factor,
         path_factor_op=args.path_factor_op,
     )
@@ -127,6 +149,7 @@ def main() -> int:
         ruleset=ruleset,
         scoring_mode=str(resolved_effective_config["scoring"]),
         paper_weights=list(resolved_effective_config["paper_weights"]),
+        tau=(float(resolved_effective_config["tau"]) if "tau" in resolved_effective_config else None),
         paper_mode=str(resolved_effective_config["paper_mode"]),
         resolved_effective_config=resolved_effective_config,
         prereq_policy=args.prereq_policy,
@@ -137,6 +160,8 @@ def main() -> int:
         graph_path_allowlist=allowlist,
         max_graph_path_edges=args.max_graph_path_edges,
         max_graph_path_candidates_per_match=args.max_graph_path_candidates_per_match,
+        global_refine_mode=args.global_refine,
+        global_refine_every=max(1, int(args.global_refine_every)),
     )
     source = FileJsonlSource(args.events, follow=args.follow)
 
